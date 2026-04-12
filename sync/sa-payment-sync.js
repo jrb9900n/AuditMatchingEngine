@@ -2,23 +2,14 @@
  * sa-payment-sync.js
  * Service Autopilot Payment Batch Downloader
  *
- * CONFIRMED ENDPOINT (reverse-engineered 2026-04-12):
- *   POST /WebServices/PaymentListWs.asmx/Query
+ * CONFIRMED ENDPOINT: POST /WebServices/PaymentListWs.asmx/Query
+ * TOTAL RECORDS (1/1/2023-4/12/2026): 6,090
  *
- * RESPONSE WRAPPED IN: { d: { Total, PaymentItems: [...] } }
- *
- * PAYMENT FIELDS (per record):
- *   ID, CustomerID, PaymentDate, Client, Address,
- *   PaymentAmount, UnusedAmount, RefundedAmount,
- *   Reference, Notes, Type, Deleted, Unrestorable
- *
- * PAYMENT DETAIL (via PaymentOverlayWs):
- *   PaymentID, CustomerID, CustomerName, Date, Amount,
- *   AppliedAmount, UnusedAmount, Deposited, PaymentMethodType,
- *   PaymentMethodName, IsCreditCardPayment, IsACHPayment,
- *   IsPrePayment, HasRefunds, QboID, TxnID, HasQBO
- *
- * TOTAL RECORDS (1/1/2023 - 4/12/2026): 6,090
+ * PAGINATION NOTE:
+ *   StartRow and MaxRow are 1-based inclusive range (not offset+size).
+ *   Batch 1: StartRow:1,   MaxRow:100  -> rows 1-100
+ *   Batch 2: StartRow:101, MaxRow:200  -> rows 101-200
+ *   Batch 3: StartRow:201, MaxRow:300  -> rows 201-300
  */
 
 const { chromium } = require('playwright');
@@ -32,33 +23,29 @@ const DELAY_MS = 300;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const delay = ms => new Promise(r => setTimeout(r, ms));
 
-function buildPayload(startRow, batchSize, startDate, endDate) {
-  return {
-    PaymentListQueryData: {
-      StartRow: startRow,
-      StartDate: { Month: startDate.month, Day: startDate.day, Year: startDate.year },
-      EndDate: { Month: endDate.month, Day: endDate.day, Year: endDate.year },
-      Client: '',
-      Reference: '',
-      MaxRow: startRow + batchSize - 1,
-      Address: '',
-      PaymentMethodTypes: [],
-      ActiveTab: 'Payments'
-    }
-  };
+function parseAmount(val) {
+  if (typeof val === 'number') return val;
+  return parseFloat(String(val).replace(/[$,]/g, '')) || 0;
 }
 
-async function fetchPaymentBatch(page, startRow, startDate, endDate) {
-  const payload = buildPayload(startRow, BATCH_SIZE, startDate, endDate);
-  const result = await page.evaluate(async (payload) => {
+async function fetchPaymentBatch(page, startRow, endRow, startDate, endDate) {
+  return page.evaluate(async ({ startRow, endRow, startDate, endDate }) => {
     const res = await fetch('/WebServices/PaymentListWs.asmx/Query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        PaymentListQueryData: {
+          StartRow: startRow,
+          StartDate: { Month: startDate.month, Day: startDate.day, Year: startDate.year },
+          EndDate:   { Month: endDate.month,   Day: endDate.day,   Year: endDate.year },
+          Client: '', Reference: '',
+          MaxRow: endRow,
+          Address: '', PaymentMethodTypes: [], ActiveTab: 'Payments'
+        }
+      })
     });
     return res.json();
-  }, payload);
-  return result?.d?.PaymentItems || [];
+  }, { startRow, endRow, startDate, endDate });
 }
 
 async function saveToSupabase(payments) {
@@ -69,17 +56,19 @@ async function saveToSupabase(payments) {
     client:          p.Client,
     address:         p.Address,
     payment_date:    p.PaymentDate,
-    payment_amount:  parseFloat(p.PaymentAmount?.replace(/[$,]/g, '')) || 0,
-    unused_amount:   parseFloat(p.UnusedAmount?.replace(/[$,]/g, '')) || 0,
-    refunded_amount: parseFloat(p.RefundedAmount?.replace(/[$,]/g, '')) || 0,
+    payment_amount:  parseAmount(p.PaymentAmount),
+    unused_amount:   parseAmount(p.UnusedAmount),
+    refunded_amount: parseAmount(p.RefundedAmount),
     reference:       p.Reference,
     notes:           p.Notes,
     payment_type:    p.Type,
-    deleted:         p.Deleted,
+    deleted:         p.Deleted || false,
     raw_data:        p,
     synced_at:       new Date().toISOString()
   }));
-  const { error } = await supabase.from('sa_payments').upsert(rows, { onConflict: 'sa_id' });
+  const { error } = await supabase
+    .from('sa_payments')
+    .upsert(rows, { onConflict: 'sa_id' });
   if (error) console.error('[SUPABASE ERROR]', error.message);
   else console.log(`[SUPABASE] Saved ${rows.length} payments`);
 }
@@ -109,18 +98,26 @@ async function run() {
   let emptyCount = 0;
 
   while (emptyCount < 3) {
-    console.log(`[SA-SYNC] Fetching payments rows ${startRow}-${startRow + BATCH_SIZE}...`);
-    const batch = await fetchPaymentBatch(page, startRow, START_DATE, END_DATE);
-    if (!batch.length) { emptyCount++; break; }
-    emptyCount = 0;
-    await saveToSupabase(batch);
-    totalFetched += batch.length;
-    console.log(`[SA-SYNC] Progress: ${totalFetched} payments synced`);
-    startRow += BATCH_SIZE;
-    await delay(DELAY_MS);
+    const endRow = startRow + BATCH_SIZE - 1;
+    console.log(`[SA-SYNC] Fetching payments rows ${startRow}-${endRow}...`);
+    
+    const result = await fetchPaymentBatch(page, startRow, endRow, START_DATE, END_DATE);
+    const batch = result?.d?.PaymentItems || [];
+
+    if (!batch.length) {
+      emptyCount++;
+      console.log(`[SA-SYNC] Empty batch (${emptyCount}/3)`);
+    } else {
+      emptyCount = 0;
+      await saveToSupabase(batch);
+      totalFetched += batch.length;
+      console.log(`[SA-SYNC] Progress: ${totalFetched} payments synced`);
+      startRow += BATCH_SIZE;
+      await delay(DELAY_MS);
+    }
   }
 
-  console.log(`[SA-SYNC] Complete. Total payments: ${totalFetched}`);
+  console.log(`[SA-SYNC] Complete. Total: ${totalFetched} payments`);
   await browser.close();
 }
 
