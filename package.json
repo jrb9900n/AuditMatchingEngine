@@ -1,0 +1,14 @@
+{
+  "name": "audit-matching-engine",
+  "version": "1.0.0",
+  "description": "QuickBooks <-> Service Autopilot financial reconciliation engine",
+  "scripts": {
+    "sync": "node sync/sa-accounting-sync.js",
+    "discover": "node sync/sa-accounting-sync.js"
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "express": "^4.18.2",
+    "dotenv": "^16.3.1"
+  }
+}
