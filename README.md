@@ -1,38 +1,77 @@
 # AuditMatchingEngine
 
-Financial reconciliation engine that pulls invoice, payment, and accounting data from Service Autopilot and matches it against QuickBooks Online.
+Financial reconciliation engine matching QuickBooks Online invoices and payments against Service Autopilot data.
 
-## Status: 🟢 Active Development
+## Status: 🟢 Ready to Run
 
-### Confirmed SA Endpoints (discovered 2026-04-12)
-- `POST /AccountingBFF/InvoiceList/V2InvoiceList_Query` — **Invoice list with date/filter/pagination**
-- `POST /AccountingBFF/InvoiceList/v2QueryTotals` — Invoice totals summary
-- `POST /WebServices/BatchExportWs.asmx/GetBatchExport` — Batch export
-- `POST /WebServices/AlertsWs.asmx/GetUserAlertCount` — Auth check / alerts
-- Payments endpoint: **TBD** (next discovery session)
+## Confirmed SA Endpoints (all reverse-engineered from browser session)
 
-### Data Confirmed
-- **8,355 invoices** found in date range 1/1/2023 - 4/12/2026
-- Each invoice contains: ID, InvoiceNumber, Status, Date, Client, CustomerID, InvoiceBalance, InvoiceTotal, AccountBalance, QBStatus, QboID, and 20+ more fields
+### Invoices
+- `POST /AccountingBFF/InvoiceList/V2InvoiceList_Query` — paginated invoice list
+- `POST /AccountingBFF/InvoiceList/v2QueryTotals` — invoice totals
+- `POST /WebServices/InvoiceOverlay.asmx/GetInvoice` — single invoice detail
+
+### Payments
+- `POST /WebServices/PaymentListWs.asmx/Query` — paginated payment list
+- `POST /WebServices/PaymentOverlayWs.asmx/GetPaymentData` — full payment detail (includes QboID)
+- `POST /WebServices/PaymentOverlayWs.asmx/GetAppliedInvoices` — invoices this payment was applied to ✅
+- `POST /WebServices/PaymentOverlayWs.asmx/GetPaymentTransactionStatus` — CC settlement status
+
+### Other
+- `POST /WebServices/AlertsWs.asmx/GetUserAlertCount` — auth check / keep-alive
+- `POST /WebServices/BatchExportWs.asmx/GetBatchExport` — batch export
+
+## Data Summary
+| Dataset | Records | Date Range |
+|---|---|---|
+| SA Invoices | 8,355 | 1/1/2023 - 4/12/2026 |
+| SA Payments | 6,090 | 1/1/2023 - 4/12/2026 |
+
+## Key Fields for QB Matching
+- **Invoices:** `QboID` (direct QB link), `InvoiceNumber`, `CustomerID`, `InvoiceTotal`, `InvoiceBalance`
+- **Payments:** `QboID` (direct QB link), `CustomerID`, `PaymentAmount`, `PaymentDate`
+- **Applications:** `PaymentID → InvoiceNumber`, `AmountApplied`, `BalanceAfter`
 
 ## Architecture
-- `sync/sa-invoice-sync.js` — Playwright-based batch invoice downloader (ready to run)
-- `sync/sa-accounting-sync.js` — General accounting endpoint discovery script
-- `supabase/schema.sql` — Database schema for SA invoices, payments, QB invoices, audit matches
-- `matching/` — Fuzzy matching engine (coming next)
-- `api/` — Express.js API layer (coming next)
-- `dashboard/` — React reconciliation dashboard (coming next)
+
+```
+SA Browser Session (Playwright)
+    ↓
+sa-invoice-sync.js          → sa_invoices (Supabase)
+sa-payment-sync.js          → sa_payments (Supabase)
+sa-payment-applications-sync.js → sa_payment_applications (Supabase)
+    ↓
+matching-engine.js (TODO)
+    ↓
+audit_matches (Supabase)
+    ↓
+React Dashboard (TODO)
+```
+
+## Sync Order
+Run scripts in this order:
+```bash
+node sync/sa-invoice-sync.js
+node sync/sa-payment-sync.js
+node sync/sa-payment-applications-sync.js
+```
 
 ## Setup
-
 ```bash
 npm install
 cp .env.example .env
 # Fill in SA_EMAIL, SA_PASSWORD, SUPABASE_URL, SUPABASE_SERVICE_KEY
 npx playwright install chromium
-node sync/sa-invoice-sync.js
+# Run schema in Supabase SQL editor first
 ```
 
-## SA Authentication
+## Authentication
 SA uses ASP.NET Forms Authentication + Incapsula WAF.
-Must use real Chromium browser via Playwright — direct HTTP calls are blocked.
+Must use real Chromium via Playwright — direct HTTP calls return login page HTML.
+Login fields: `#txtLogin` (email), `#txtPassword`
+
+## Matching Strategy (planned)
+1. **Direct match via QboID** — invoices and payments with QboID link directly to QB records
+2. **Invoice number match** — SA InvoiceNumber vs QB InvoiceNumber
+3. **Fuzzy match** — customer name + amount + date proximity for unmatched records
+4. **Flag discrepancies** — amount differences, missing records, QB sync errors
