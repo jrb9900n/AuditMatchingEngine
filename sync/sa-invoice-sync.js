@@ -1,33 +1,13 @@
 /**
  * sa-invoice-sync.js
  * Service Autopilot Invoice Batch Downloader
- * 
- * Pulls all invoices from SA via browser session and saves to Supabase.
- * 
- * CONFIRMED ENDPOINTS (reverse-engineered 2026-04-12):
- *   POST /AccountingBFF/InvoiceList/V2InvoiceList_Query  -- invoice list
- *   POST /AccountingBFF/InvoiceList/v2QueryTotals        -- totals
- *   POST /WebServices/BatchExportWs.asmx/GetBatchExport  -- batch export
- *   POST /WebServices/AlertsWs.asmx/GetUserAlertCount    -- alerts (auth check)
  *
- * INVOICE DATA FIELDS (per record):
- *   ID, Status, Action, Date, InvoiceDueDate, InvoiceNumber,
- *   Client, CustomerID, Address, Frequency, PaymentType,
- *   PrepaymentBalance, CreditBalance, InvoiceBalance, InvoiceTotal,
- *   AccountBalance, FlagInvoice, DaysPastDue, IsContract, IsPastDue,
- *   Processing, NeedToPrint, NeedToEmail, HasCashDiscount,
- *   QBStatus, QboID, ContractID, Deleted, Unrestorable
+ * CONFIRMED ENDPOINT: POST /AccountingBFF/InvoiceList/V2InvoiceList_Query
+ * TOTAL RECORDS (1/1/2023-4/12/2026): 8,355
  *
- * DATE FILTER PAYLOAD STRUCTURE:
- *   ScreenViewFilterType: 76  (date range filter)
- *   Items[0].Value: "6"       (filter mode)
- *   Items[1].Value: JSON date object {Month, Day, Year} -- start date
- *   Items[2].Value: JSON date object {Month, Day, Year} -- end date
- *
- * PAGINATION:
- *   StartRow: 0-based row offset
- *   Max: batch size (use 100 for efficiency)
- *   Total records in date range 1/1/2023-4/12/2026: 8,355
+ * NOTE: InvoiceNumber can be "32310" or "31745 (Contract)" format.
+ *       Stored as TEXT in invoice_number.
+ *       Numeric portion parsed into invoice_number_int for matching.
  */
 
 const { chromium } = require('playwright');
@@ -36,14 +16,23 @@ require('dotenv').config();
 
 const SA_BASE = 'https://my.serviceautopilot.com';
 const BATCH_SIZE = 100;
-const DELAY_MS = 300; // polite delay between requests
+const DELAY_MS = 300;
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
-
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const delay = ms => new Promise(r => setTimeout(r, ms));
+
+// Parse "32310" or "31745 (Contract)" -> { text: "31745 (Contract)", int: 31745 }
+function parseInvoiceNumber(val) {
+  if (!val && val !== 0) return { text: null, int: null };
+  const str = String(val).trim();
+  const match = str.match(/^(\d+)/);
+  return { text: str, int: match ? parseInt(match[1], 10) : null };
+}
+
+function parseAmount(val) {
+  if (typeof val === 'number') return val;
+  return parseFloat(String(val).replace(/[$,]/g, '')) || 0;
+}
 
 function buildPayload(startRow, batchSize, startDate, endDate) {
   return {
@@ -83,31 +72,36 @@ async function fetchInvoiceBatch(page, startRow, startDate, endDate) {
 
 async function saveToSupabase(invoices) {
   if (!invoices.length) return;
-  const rows = invoices.map(inv => ({
-    sa_id: inv.ID,
-    invoice_number: inv.InvoiceNumber,
-    status: inv.Status,
-    date: inv.Date,
-    due_date: inv.InvoiceDueDate,
-    client: inv.Client,
-    customer_id: inv.CustomerID,
-    address: inv.Address,
-    frequency: inv.Frequency,
-    payment_type: inv.PaymentType,
-    prepayment_balance: inv.PrepaymentBalance,
-    credit_balance: inv.CreditBalance,
-    invoice_balance: inv.InvoiceBalance,
-    invoice_total: inv.InvoiceTotal,
-    account_balance: inv.AccountBalance,
-    days_past_due: inv.DaysPastDue,
-    is_past_due: inv.IsPastDue,
-    qb_status: inv.QBStatus,
-    qbo_id: inv.QboID,
-    contract_id: inv.ContractID,
-    deleted: inv.Deleted,
-    raw_data: inv,
-    synced_at: new Date().toISOString()
-  }));
+  const rows = invoices.map(inv => {
+    const invNum = parseInvoiceNumber(inv.InvoiceNumber);
+    return {
+      sa_id:              inv.ID,
+      invoice_number:     invNum.text,
+      invoice_number_int: invNum.int,
+      status:             inv.Status,
+      date:               inv.Date,
+      due_date:           inv.InvoiceDueDate,
+      client:             inv.Client,
+      customer_id:        inv.CustomerID,
+      address:            inv.Address,
+      frequency:          inv.Frequency,
+      payment_type:       inv.PaymentType,
+      prepayment_balance: parseAmount(inv.PrepaymentBalance),
+      credit_balance:     parseAmount(inv.CreditBalance),
+      invoice_balance:    parseAmount(inv.InvoiceBalance),
+      invoice_total:      parseAmount(inv.InvoiceTotal),
+      account_balance:    parseAmount(inv.AccountBalance),
+      days_past_due:      inv.DaysPastDue || 0,
+      is_past_due:        inv.IsPastDue || false,
+      is_contract:        inv.IsContract || false,
+      qb_status:          inv.QBStatus,
+      qbo_id:             inv.QboID || null,
+      contract_id:        inv.ContractID || null,
+      deleted:            inv.Deleted || false,
+      raw_data:           inv,
+      synced_at:          new Date().toISOString()
+    };
+  });
 
   const { error } = await supabase
     .from('sa_invoices')
@@ -122,8 +116,10 @@ async function run() {
   const END_DATE   = { month: 4, day: 12, year: 2026 };
 
   if (!process.env.SA_EMAIL || !process.env.SA_PASSWORD) {
-    console.error('[ERROR] SA_EMAIL and SA_PASSWORD required in .env');
-    process.exit(1);
+    console.error('[ERROR] SA_EMAIL and SA_PASSWORD required in .env'); process.exit(1);
+  }
+  if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+    console.error('[ERROR] SUPABASE_URL and SUPABASE_SERVICE_KEY required in .env'); process.exit(1);
   }
 
   console.log('[SA-SYNC] Launching browser...');
@@ -133,48 +129,37 @@ async function run() {
   });
   const page = await context.newPage();
 
-  // LOGIN
   console.log('[SA-SYNC] Logging in...');
   await page.goto(SA_BASE, { waitUntil: 'networkidle' });
   await page.fill('#txtLogin', process.env.SA_EMAIL);
   await page.fill('#txtPassword', process.env.SA_PASSWORD);
   await page.click('button:has-text("Log In")');
   await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 });
-  console.log('[SA-SYNC] Logged in. URL:', page.url());
-
-  // Navigate to InvoiceList to establish session context
+  console.log('[SA-SYNC] Logged in. Navigating to invoices...');
   await page.goto(`${SA_BASE}/InvoiceList.aspx`, { waitUntil: 'networkidle' });
   await delay(2000);
 
-  // GET TOTAL COUNT first
-  const firstBatch = await fetchInvoiceBatch(page, 0, START_DATE, END_DATE);
-  console.log(`[SA-SYNC] First batch returned ${firstBatch.length} invoices`);
-
-  // We know total is ~8,355 — fetch in batches
   let startRow = 0;
   let totalFetched = 0;
-  let consecutiveEmpty = 0;
+  let emptyCount = 0;
 
-  while (consecutiveEmpty < 3) {
-    console.log(`[SA-SYNC] Fetching rows ${startRow} - ${startRow + BATCH_SIZE}...`);
+  while (emptyCount < 3) {
+    console.log(`[SA-SYNC] Fetching rows ${startRow}-${startRow + BATCH_SIZE}...`);
     const batch = await fetchInvoiceBatch(page, startRow, START_DATE, END_DATE);
-
     if (!batch.length) {
-      consecutiveEmpty++;
-      console.log(`[SA-SYNC] Empty batch (${consecutiveEmpty}/3). Done.`);
-      break;
+      emptyCount++;
+      console.log(`[SA-SYNC] Empty batch (${emptyCount}/3)`);
+    } else {
+      emptyCount = 0;
+      await saveToSupabase(batch);
+      totalFetched += batch.length;
+      console.log(`[SA-SYNC] Progress: ${totalFetched} invoices synced`);
+      startRow += BATCH_SIZE;
+      await delay(DELAY_MS);
     }
-
-    consecutiveEmpty = 0;
-    await saveToSupabase(batch);
-    totalFetched += batch.length;
-    console.log(`[SA-SYNC] Progress: ${totalFetched} invoices synced`);
-
-    startRow += BATCH_SIZE;
-    await delay(DELAY_MS);
   }
 
-  console.log(`[SA-SYNC] Complete. Total invoices synced: ${totalFetched}`);
+  console.log(`[SA-SYNC] Complete. Total: ${totalFetched} invoices`);
   await browser.close();
 }
 
