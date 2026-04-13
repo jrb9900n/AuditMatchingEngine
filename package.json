@@ -3,13 +3,16 @@
   "version": "1.0.0",
   "description": "QuickBooks <-> Service Autopilot financial reconciliation engine",
   "scripts": {
+    "setup": "node setup.js",
     "sync:invoices": "node sync/sa-invoice-sync.js",
     "sync:payments": "node sync/sa-payment-sync.js",
     "sync:applications": "node sync/sa-payment-applications-sync.js",
+    "sync:sa": "npm run sync:invoices && npm run sync:payments && npm run sync:applications",
     "sync:qb": "node sync/qb-sync.js",
-    "sync:all": "npm run sync:invoices && npm run sync:payments && npm run sync:applications && npm run sync:qb",
+    "sync:all": "npm run sync:sa && npm run sync:qb",
     "match": "node matching/matching-engine.js",
-    "run:full": "npm run sync:all && npm run match"
+    "run:full": "npm run sync:all && npm run match",
+    "get:qb-tokens": "node sync/qb-get-tokens.js"
   },
   "dependencies": {
     "playwright": "^1.40.0",
