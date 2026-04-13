@@ -8,21 +8,38 @@ async function test() {
     { headers: { 'Authorization': 'Basic ' + creds, 'Content-Type': 'application/x-www-form-urlencoded' } }
   );
   const token = r.data.access_token;
-  console.log('[TEST] Token refreshed OK');
-  console.log('[TEST] Client ID being used:', process.env.QB_CLIENT_ID?.substring(0,20));
+  console.log('[TEST] Token refreshed. Now trying all known realm IDs...');
 
-  for (const realm of ['9341456862365430', '9341456862346650', '9341456862333687']) {
+  // All realm IDs we've seen across this project
+  const realms = [
+    '9341456862365430',  // from QB homepage URL
+    '9341456862346650',  // from developer dashboard
+    '9341456862333687',  // from developer dashboard alternate
+    '193514489',         // common format short ID
+  ];
+
+  for (const realm of realms) {
     try {
       const res = await axios.get(
         'https://quickbooks.api.intuit.com/v3/company/' + realm + '/companyinfo/' + realm,
         { headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' } }
       );
-      console.log('[REALM ' + realm + '] SUCCESS:', res.data.CompanyInfo?.CompanyName);
+      console.log('[REALM ' + realm + '] ✅ SUCCESS:', res.data.CompanyInfo?.CompanyName);
     } catch(e) {
-      const errData = e.response?.data;
-      console.log('[REALM ' + realm + '] status:', e.response?.status);
-      console.log('[REALM ' + realm + '] full error:', JSON.stringify(errData));
+      const code = e.response?.data?.Fault?.Error?.[0]?.code;
+      console.log('[REALM ' + realm + '] ❌', e.response?.status, 'code:', code);
     }
+  }
+
+  // Also try to get the realm from the token introspection
+  try {
+    const intro = await axios.post('https://oauth.platform.intuit.com/oauth2/v1/tokens/userinfo',
+      null,
+      { headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' } }
+    );
+    console.log('[USERINFO]', JSON.stringify(intro.data));
+  } catch(e) {
+    console.log('[USERINFO failed]', e.response?.status, JSON.stringify(e.response?.data));
   }
 }
 test().catch(e => console.error('[ERROR]', e.message));
