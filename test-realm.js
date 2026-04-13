@@ -9,6 +9,7 @@ async function test() {
   );
   const token = r.data.access_token;
   console.log('[TEST] Token refreshed OK');
+  console.log('[TEST] Client ID being used:', process.env.QB_CLIENT_ID?.substring(0,20));
 
   for (const realm of ['9341456862365430', '9341456862346650', '9341456862333687']) {
     try {
@@ -18,9 +19,10 @@ async function test() {
       );
       console.log('[REALM ' + realm + '] SUCCESS:', res.data.CompanyInfo?.CompanyName);
     } catch(e) {
-      console.log('[REALM ' + realm + '] FAILED:', e.response?.status, e.response?.data?.Fault?.Error?.[0]?.Message || '');
+      const errData = e.response?.data;
+      console.log('[REALM ' + realm + '] status:', e.response?.status);
+      console.log('[REALM ' + realm + '] full error:', JSON.stringify(errData));
     }
   }
 }
-
 test().catch(e => console.error('[ERROR]', e.message));
