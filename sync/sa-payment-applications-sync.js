@@ -12,7 +12,8 @@ require('dotenv').config();
 
 const SA_BASE  = 'https://my.serviceautopilot.com';
 const DELAY_MS = 10000;
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 6;
+const fs = require('fs');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const delay = ms => new Promise(r => setTimeout(r, ms));
