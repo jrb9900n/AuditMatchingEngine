@@ -11,7 +11,7 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const SA_BASE  = 'https://my.serviceautopilot.com';
-const DELAY_MS = 5000;
+const DELAY_MS = 10000;
 const MAX_RETRIES = 3;
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
