@@ -11,7 +11,7 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const SA_BASE  = 'https://my.serviceautopilot.com';
-const DELAY_MS = 10000;
+const DELAY_MS = 300;
 const MAX_RETRIES = 6;
 const fs = require('fs');
 
@@ -85,7 +85,7 @@ async function getAlreadyProcessed() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function run() {
   console.log('[APP-SYNC] Starting...');
-  const browser = await chromium.launch({ headless: false, slowMo: 50 });
+  const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   });
@@ -127,11 +127,10 @@ async function run() {
         continue;
       }
 
-      // Other error
+      // Non-session error (network, bad JSON, etc.) — no point retrying
       if (result?.error) {
-        console.warn(`[APP-SYNC] Fetch error attempt ${attempt}: ${result.error}`);
-        await delay(500 * attempt);
-        continue;
+        console.warn(`[APP-SYNC] Fetch error (no retry): ${result.error}`);
+        break;
       }
 
       success = true;
