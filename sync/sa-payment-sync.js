@@ -74,8 +74,28 @@ async function saveToSupabase(payments) {
 }
 
 async function run() {
-  const START_DATE = { month: 1, day: 1, year: 2023 };
-  const END_DATE   = { month: 4, day: 12, year: 2026 };
+  // END_DATE is always today so each run picks up new payments.
+  const now = new Date();
+  const END_DATE = { month: now.getMonth() + 1, day: now.getDate(), year: now.getFullYear() };
+
+  // Incremental mode: if the table already has recent data (last payment within 7 days),
+  // scan only the past 90 days to keep weekly runs fast (~15 min vs 1-2 hrs full).
+  let startFrom = new Date('2023-01-01');
+  try {
+    const { data } = await supabase.from('sa_payments').select('payment_date').order('payment_date', { ascending: false }).limit(1);
+    if (data?.[0]?.payment_date) {
+      const daysSince = (now - new Date(data[0].payment_date)) / 86400000;
+      if (daysSince < 7) {
+        startFrom = new Date(now - 90 * 86400000);
+        console.log(`[SA-SYNC] Incremental mode: ${startFrom.toISOString().slice(0, 10)} to today`);
+      } else {
+        console.log(`[SA-SYNC] Full mode: last payment ${data[0].payment_date} is ${Math.round(daysSince)}d old`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[SA-SYNC] Could not check last sync date, using full mode: ${e.message}`);
+  }
+  const START_DATE = { month: startFrom.getMonth() + 1, day: startFrom.getDate(), year: startFrom.getFullYear() };
 
   console.log('[SA-SYNC] Launching browser...');
   const browser = await chromium.launch({ headless: false, slowMo: 50 });
