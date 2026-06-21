@@ -112,8 +112,28 @@ async function saveToSupabase(invoices) {
 }
 
 async function run() {
-  const START_DATE = { month: 1, day: 1, year: 2023 };
-  const END_DATE   = { month: 4, day: 12, year: 2026 };
+  // END_DATE is always today so each run picks up new invoices.
+  const now = new Date();
+  const END_DATE = { month: now.getMonth() + 1, day: now.getDate(), year: now.getFullYear() };
+
+  // Incremental mode: if the table already has recent data (last invoice within 7 days),
+  // scan only the past 90 days to keep weekly runs fast (~15 min vs 1-2 hrs full).
+  let startFrom = new Date('2023-01-01');
+  try {
+    const { data } = await supabase.from('sa_invoices').select('date').order('date', { ascending: false }).limit(1);
+    if (data?.[0]?.date) {
+      const daysSince = (now - new Date(data[0].date)) / 86400000;
+      if (daysSince < 7) {
+        startFrom = new Date(now - 90 * 86400000);
+        console.log(`[SA-SYNC] Incremental mode: ${startFrom.toISOString().slice(0, 10)} to today`);
+      } else {
+        console.log(`[SA-SYNC] Full mode: last invoice ${data[0].date} is ${Math.round(daysSince)}d old`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[SA-SYNC] Could not check last sync date, using full mode: ${e.message}`);
+  }
+  const START_DATE = { month: startFrom.getMonth() + 1, day: startFrom.getDate(), year: startFrom.getFullYear() };
 
   if (!process.env.SA_EMAIL || !process.env.SA_PASSWORD) {
     console.error('[ERROR] SA_EMAIL and SA_PASSWORD required in .env'); process.exit(1);
