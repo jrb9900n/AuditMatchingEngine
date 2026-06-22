@@ -122,6 +122,15 @@ async function run() {
       if (result?.__html_response) {
         sessionErrors++;
         console.log(`[APP-SYNC] Session expired (payment ${payment.sa_id}), re-logging in... (attempt ${attempt})`);
+
+        // If we've re-logged in many times but saved nothing, the portal is likely
+        // blocking the session entirely (e.g. bot detection). Abort early.
+        if (sessionErrors >= 20 && processed === 0) {
+          console.error(`[APP-SYNC] ABORT: ${sessionErrors} re-logins with 0 successful fetches — portal is blocking this session. Exiting.`);
+          await browser.close();
+          process.exit(1);
+        }
+
         await login(page);
         await delay(1000);
         continue;
