@@ -85,7 +85,7 @@ async function getAlreadyProcessed() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function run() {
   console.log('[APP-SYNC] Starting...');
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({ headless: false });
   const context = await browser.newContext({
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   });
