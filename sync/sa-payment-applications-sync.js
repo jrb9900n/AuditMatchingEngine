@@ -13,6 +13,7 @@ require('dotenv').config();
 const SA_BASE  = 'https://my.serviceautopilot.com';
 const DELAY_MS = 300;
 const MAX_RETRIES = 6;
+const MAX_SESSION_ERRORS = 20;
 const fs = require('fs');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -123,10 +124,14 @@ async function run() {
         sessionErrors++;
         console.log(`[APP-SYNC] Session expired (payment ${payment.sa_id}), re-logging in... (attempt ${attempt})`);
 
-        // If we've re-logged in many times but saved nothing, the portal is likely
-        // blocking the session entirely (e.g. bot detection). Abort early.
-        if (sessionErrors >= 20 && processed === 0) {
-          console.error(`[APP-SYNC] ABORT: ${sessionErrors} re-logins with 0 successful fetches — portal is blocking this session. Exiting.`);
+        // Abort once re-logins pile up, regardless of earlier progress — the
+        // processed === 0 condition this used to carry meant a single early
+        // success permanently disabled this guard for the rest of the run, so
+        // a session that died for good later (password rotation, WAF block)
+        // would grind through every remaining payment doing up to MAX_RETRIES
+        // failed logins each, effectively hanging run:full for hours.
+        if (sessionErrors >= MAX_SESSION_ERRORS) {
+          console.error(`[APP-SYNC] ABORT: ${sessionErrors} total re-logins this run — SA session cannot be sustained. Exiting.`);
           await browser.close();
           process.exit(1);
         }

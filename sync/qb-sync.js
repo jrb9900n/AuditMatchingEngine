@@ -33,12 +33,30 @@ async function refreshAccessToken() {
   }
 }
 
-async function qbQuery(token, query) {
-  const res = await axios.get(`${QB_BASE}/${REALM_ID}/query`, {
-    params: { query, minorversion: 65 },
-    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
-  });
-  return res.data.QueryResponse;
+// A single transient QBO error (5xx, rate limit, network blip) used to crash the
+// entire sync with no partial-progress resilience — one bad page mid-loop meant
+// every earlier page's work stood, but nothing after it (including payments,
+// which sync after invoices) ran that invocation. Retries only genuinely
+// transient conditions; a real 4xx (auth, bad query) still fails immediately.
+async function qbQuery(token, query, attempt = 1) {
+  const MAX_ATTEMPTS = 4;
+  try {
+    const res = await axios.get(`${QB_BASE}/${REALM_ID}/query`, {
+      params: { query, minorversion: 65 },
+      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' }
+    });
+    return res.data.QueryResponse;
+  } catch (err) {
+    const status = err.response?.status;
+    const isTransient = !err.response || status >= 500 || status === 429;
+    if (isTransient && attempt < MAX_ATTEMPTS) {
+      const backoffMs = 500 * 2 ** (attempt - 1);
+      console.warn(`[QB-SYNC] Transient error (${status || err.code}), retry ${attempt}/${MAX_ATTEMPTS - 1} in ${backoffMs}ms`);
+      await delay(backoffMs);
+      return qbQuery(token, query, attempt + 1);
+    }
+    throw err;
+  }
 }
 
 async function syncInvoices(token) {
