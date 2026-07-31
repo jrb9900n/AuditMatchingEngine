@@ -28,6 +28,13 @@ function parseAmount(val) {
   return parseFloat(String(val).replace(/[$,]/g, '')) || 0;
 }
 
+function parseDate(val) {
+  if (!val) return null;
+  const m = String(val).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+  return val;
+}
+
 async function fetchPaymentBatch(page, startRow, endRow, startDate, endDate) {
   return page.evaluate(async ({ startRow, endRow, startDate, endDate }) => {
     const res = await fetch('/WebServices/PaymentListWs.asmx/Query', {
@@ -55,7 +62,7 @@ async function saveToSupabase(payments) {
     customer_id:     p.CustomerID,
     client:          p.Client,
     address:         p.Address,
-    payment_date:    p.PaymentDate,
+    payment_date:    parseDate(p.PaymentDate),
     payment_amount:  parseAmount(p.PaymentAmount),
     unused_amount:   parseAmount(p.UnusedAmount),
     refunded_amount: parseAmount(p.RefundedAmount),

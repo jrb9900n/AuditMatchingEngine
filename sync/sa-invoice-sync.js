@@ -34,6 +34,13 @@ function parseAmount(val) {
   return parseFloat(String(val).replace(/[$,]/g, '')) || 0;
 }
 
+function parseDate(val) {
+  if (!val) return null;
+  const m = String(val).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return `${m[3]}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+  return val;
+}
+
 function buildPayload(startRow, batchSize, startDate, endDate) {
   return {
     QueryInput: {
@@ -79,8 +86,8 @@ async function saveToSupabase(invoices) {
       invoice_number:     invNum.text,
       invoice_number_int: invNum.int,
       status:             inv.Status,
-      date:               inv.Date,
-      due_date:           inv.InvoiceDueDate,
+      date:               parseDate(inv.Date),
+      due_date:           parseDate(inv.InvoiceDueDate),
       client:             inv.Client,
       customer_id:        inv.CustomerID,
       address:            inv.Address,
