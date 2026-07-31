@@ -11,7 +11,8 @@
     "sync:qb": "node sync/qb-sync.js",
     "sync:all": "npm run sync:sa && npm run sync:qb",
     "match": "node matching/matching-engine.js",
-    "run:full": "npm run sync:all && npm run match",
+    "match:payments": "node matching/payment-matching-engine.js",
+    "run:full": "npm run sync:all && npm run match && npm run match:payments",
     "get:qb-tokens": "node sync/qb-get-tokens.js"
   },
   "dependencies": {
