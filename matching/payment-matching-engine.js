@@ -16,6 +16,13 @@
  *   Customer name similarity (Levenshtein) + amount match (exact, payments
  *   don't partial-settle the way invoice balances do) + date proximity.
  *   Flags for human review when score < FUZZY_THRESHOLD.
+ *
+ * Pre-cutoff records are excluded before matching (see DATA_START_DATE_MS) —
+ * confirmed live 2026-08-29 that 478 of 499 unmatched_qb rows (95.8% of the
+ * $730,745.67 total) were dated 2023 or earlier, before SA's payment records
+ * reliably go back. Unlike invoices, payments have no balance field to
+ * separate "settled" from "open" with, so the date cutoff is the only lever
+ * here — this is expected to remove nearly all of that historical noise.
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -28,6 +35,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const FUZZY_THRESHOLD  = 0.75;
 const AMOUNT_TOLERANCE = 0.02;
 const DATE_WINDOW_DAYS = 7;
+
+// Confirmed by Michael 2026-08-29 — same cutoff as matching-engine.js.
+const DATA_START_DATE_MS = new Date('2023-08-21T00:00:00Z').getTime();
 
 function levenshtein(a, b) {
   const m = a.length, n = b.length;
@@ -100,17 +110,29 @@ function fuzzyScore(sa, qb) {
 
 async function runMatching() {
   console.log('[PAY-MATCH] Loading SA payments...');
-  const { data: saPayments, error: saErr } = await supabase
+  const { data: saPaymentsRaw, error: saErr } = await supabase
     .from('sa_payments')
     .select('*')
     .eq('deleted', false);
   if (saErr) throw new Error('SA payments: ' + saErr.message);
 
   console.log('[PAY-MATCH] Loading QB payments...');
-  const { data: qbPayments, error: qbErr } = await supabase
+  const { data: qbPaymentsRaw, error: qbErr } = await supabase
     .from('qb_payments')
     .select('*');
   if (qbErr) throw new Error('QB payments: ' + qbErr.message);
+
+  const isRelevant = (row, dateField) => {
+    const t = parseDateMs(row[dateField]);
+    return t === null || t >= DATA_START_DATE_MS;
+  };
+  const saPayments = saPaymentsRaw.filter(r => isRelevant(r, 'payment_date'));
+  const qbPayments = qbPaymentsRaw.filter(r => isRelevant(r, 'date'));
+  const saExcluded = saPaymentsRaw.length - saPayments.length;
+  const qbExcluded = qbPaymentsRaw.length - qbPayments.length;
+  if (saExcluded || qbExcluded) {
+    console.log(`[PAY-MATCH] Excluded pre-2023-08-21 records: ${saExcluded} SA, ${qbExcluded} QB`);
+  }
 
   console.log(`[PAY-MATCH] Matching ${saPayments.length} SA payments against ${qbPayments.length} QB payments...`);
 

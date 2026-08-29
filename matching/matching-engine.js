@@ -23,6 +23,17 @@
  *   - missing_in_sa: QB invoice has no SA match
  *   - payment_not_applied: Payment exists but no application record
  *   - qb_sync_error: SA has QboID but QB record not found
+ *
+ * "unmatched" is split into two statuses (added 2026-08-29, see below):
+ *   - unmatched_sa / unmatched_qb: a real, currently-open invoice with no
+ *     cross-system link. Actionable.
+ *   - unmatched_settled: no cross-system link, but the invoice already has a
+ *     $0 balance (paid or voided) — historical linkage noise, not a live gap.
+ *     Confirmed live 2026-08-29: a fresh run found $29,708.61 across 65
+ *     "unmatched" invoices, but every single one had a $0 balance (some
+ *     dated back to 2023) — the true open discrepancy was $18.98. Splitting
+ *     the status keeps that distinction visible everywhere this table is
+ *     read, instead of requiring a manual balance check every time.
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -34,6 +45,14 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const FUZZY_THRESHOLD    = 0.75;   // Min score to auto-match (below = needs review)
 const AMOUNT_TOLERANCE   = 0.02;   // $0.02 tolerance for floating point differences
 const DATE_WINDOW_DAYS   = 5;      // Days window for date proximity scoring
+const SETTLED_TOLERANCE  = 0.02;   // Balance at or below this counts as "$0" (float-safe)
+
+// Confirmed by Michael 2026-08-29: anything dated before this is not relevant —
+// SA/QBO data from before this date is incomplete/unreliable on one or both
+// sides (this is when one or both systems were actually put into real use),
+// so records older than this are excluded before matching rather than being
+// flagged as permanently-unmatched noise every run.
+const DATA_START_DATE_MS = new Date('2023-08-21T00:00:00Z').getTime();
 
 // ─── Levenshtein distance ────────────────────────────────────────────────────
 function levenshtein(a, b) {
@@ -92,17 +111,31 @@ function fuzzyScore(saInvoice, qbInvoice) {
 // ─── Main matching function ──────────────────────────────────────────────────
 async function runMatching() {
   console.log('[MATCH] Loading SA invoices...');
-  const { data: saInvoices, error: saErr } = await supabase
+  const { data: saInvoicesRaw, error: saErr } = await supabase
     .from('sa_invoices')
     .select('*')
     .eq('deleted', false);
   if (saErr) throw new Error('SA invoices: ' + saErr.message);
 
   console.log('[MATCH] Loading QB invoices...');
-  const { data: qbInvoices, error: qbErr } = await supabase
+  const { data: qbInvoicesRaw, error: qbErr } = await supabase
     .from('qb_invoices')
     .select('*');
   if (qbErr) throw new Error('QB invoices: ' + qbErr.message);
+
+  // Exclude pre-cutoff records — keep unparseable/missing dates rather than
+  // silently dropping them (only exclude what we can positively confirm is old).
+  const isRelevant = row => {
+    const t = parseDateMs(row.date);
+    return t === null || t >= DATA_START_DATE_MS;
+  };
+  const saInvoices = saInvoicesRaw.filter(isRelevant);
+  const qbInvoices = qbInvoicesRaw.filter(isRelevant);
+  const saExcluded = saInvoicesRaw.length - saInvoices.length;
+  const qbExcluded = qbInvoicesRaw.length - qbInvoices.length;
+  if (saExcluded || qbExcluded) {
+    console.log(`[MATCH] Excluded pre-2023-08-21 records: ${saExcluded} SA, ${qbExcluded} QB`);
+  }
 
   console.log(`[MATCH] Matching ${saInvoices.length} SA invoices against ${qbInvoices.length} QB invoices...`);
 
@@ -159,6 +192,7 @@ async function runMatching() {
     // ── Determine discrepancy status ──────────────────────────────────────
     let status = 'unmatched_sa';
     let amountDiff = null;
+    let notes = null;
 
     if (match) {
       matchedQbIds.add(match.qb_id);
@@ -166,6 +200,12 @@ async function runMatching() {
       const qbAmt = parseAmount(match.amount);
       amountDiff  = saAmt - qbAmt;
       status = Math.abs(amountDiff) <= AMOUNT_TOLERANCE ? 'matched' : 'discrepancy';
+      if (score < FUZZY_THRESHOLD) notes = 'Low confidence fuzzy match - review recommended';
+    } else if (parseAmount(sa.invoice_balance) <= SETTLED_TOLERANCE) {
+      // No cross-system link, but this invoice already has a $0 balance —
+      // paid or voided, not an open gap. See file header comment.
+      status = 'unmatched_settled';
+      notes  = 'No QB match found, but SA invoice balance is $0 (paid/voided) — not an open discrepancy';
     }
 
     results.push({
@@ -179,7 +219,7 @@ async function runMatching() {
       amount_diff:       amountDiff,
       sa_customer:       sa.client,
       qb_customer:       match?.customer_name || null,
-      notes:             score < FUZZY_THRESHOLD && match ? 'Low confidence fuzzy match - review recommended' : null,
+      notes,
       created_at:        new Date().toISOString()
     });
   }
@@ -187,18 +227,21 @@ async function runMatching() {
   // ── Flag QB invoices with no SA match ─────────────────────────────────
   for (const qb of qbInvoices) {
     if (!matchedQbIds.has(qb.qb_id)) {
+      const settled = parseAmount(qb.balance) <= SETTLED_TOLERANCE;
       results.push({
         sa_invoice_sa_id: null,
         qb_invoice_id:    qb.qb_id,
         match_type:       'unmatched',
         match_score:      0,
-        match_status:     'unmatched_qb',
+        match_status:     settled ? 'unmatched_settled' : 'unmatched_qb',
         sa_amount:        null,
         qb_amount:        parseAmount(qb.amount),
         amount_diff:      null,
         sa_customer:      null,
         qb_customer:      qb.customer_name,
-        notes:            'In QB but not found in SA',
+        notes:            settled
+          ? 'In QB but not found in SA — QB balance is $0 (paid/voided), not an open discrepancy'
+          : 'In QB but not found in SA',
         created_at:       new Date().toISOString()
       });
     }
@@ -223,6 +266,13 @@ async function runMatching() {
   const discrepancy = results.filter(r => r.match_status === 'discrepancy').length;
   const unmatchedSA = results.filter(r => r.match_status === 'unmatched_sa').length;
   const unmatchedQB = results.filter(r => r.match_status === 'unmatched_qb').length;
+  const settled     = results.filter(r => r.match_status === 'unmatched_settled').length;
+  const discrepancyTotal = results
+    .filter(r => r.match_status === 'discrepancy')
+    .reduce((s, r) => s + Math.abs(r.amount_diff || 0), 0);
+  const unmatchedTotal = results
+    .filter(r => r.match_status === 'unmatched_sa' || r.match_status === 'unmatched_qb')
+    .reduce((s, r) => s + Math.abs(r.sa_amount ?? r.qb_amount ?? 0), 0);
 
   console.log('');
   console.log('═══════════════════════════════════════');
@@ -234,9 +284,9 @@ async function runMatching() {
   console.log(`  Tier 2 (Inv Number):   ${tier2}`);
   console.log(`  Tier 3 (Fuzzy):        ${tier3}`);
   console.log(`  ✅ Matched:            ${matched}`);
-  console.log(`  ⚠️  Discrepancies:     ${discrepancy}`);
-  console.log(`  ❌ Unmatched SA:       ${unmatchedSA}`);
-  console.log(`  ❌ Unmatched QB:       ${unmatchedQB}`);
+  console.log(`  ⚠️  Discrepancies:     ${discrepancy} ($${discrepancyTotal.toFixed(2)})`);
+  console.log(`  ❌ Unmatched (open):   ${unmatchedSA + unmatchedQB} ($${unmatchedTotal.toFixed(2)}) — ${unmatchedSA} SA, ${unmatchedQB} QB`);
+  console.log(`  ⚪ Unmatched (settled, $0 balance, not counted above): ${settled}`);
   console.log('═══════════════════════════════════════');
 }
 
