@@ -16,6 +16,17 @@
  *   Customer name similarity (Levenshtein) + amount match (exact, payments
  *   don't partial-settle the way invoice balances do) + date proximity.
  *   Flags for human review when score < FUZZY_THRESHOLD.
+ *
+ * Pre-cutoff records are reclassified to unmatched_precutoff AFTER matching,
+ * checked against each unmatched record's own date only (see DATA_START_DATE_MS)
+ * — never applied to the source arrays matching runs against, so a genuine
+ * link is never split apart because only one side's date happens to fall
+ * before the cutoff (same reasoning as matching-engine.js's classifyUnmatched,
+ * caught in code review there first). Confirmed live 2026-08-29 that 478 of
+ * 499 unmatched_qb rows (95.8% of the $730,745.67 total) were dated 2023 or
+ * earlier, before SA's payment records reliably go back. Unlike invoices,
+ * payments have no balance field to separate "settled" from "open" with, so
+ * the date cutoff is the only lever here.
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -28,6 +39,9 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 const FUZZY_THRESHOLD  = 0.75;
 const AMOUNT_TOLERANCE = 0.02;
 const DATE_WINDOW_DAYS = 7;
+
+// Confirmed by Michael 2026-08-29 — same cutoff as matching-engine.js.
+const DATA_START_DATE_MS = new Date('2023-08-21T00:00:00Z').getTime();
 
 function levenshtein(a, b) {
   const m = a.length, n = b.length;
@@ -100,17 +114,25 @@ function fuzzyScore(sa, qb) {
 
 async function runMatching() {
   console.log('[PAY-MATCH] Loading SA payments...');
-  const { data: saPayments, error: saErr } = await supabase
+  const { data: saPaymentsRaw, error: saErr } = await supabase
     .from('sa_payments')
     .select('*')
     .eq('deleted', false);
   if (saErr) throw new Error('SA payments: ' + saErr.message);
 
   console.log('[PAY-MATCH] Loading QB payments...');
-  const { data: qbPayments, error: qbErr } = await supabase
+  const { data: qbPaymentsRaw, error: qbErr } = await supabase
     .from('qb_payments')
     .select('*');
   if (qbErr) throw new Error('QB payments: ' + qbErr.message);
+
+  // NOTE: the pre-cutoff date filter is applied AFTER matching, per-record, on
+  // unmatched results only — not here on the source arrays. Matching always
+  // runs against the FULL, unfiltered SA and QB sets so a genuine link is never
+  // split apart because only one side's own date happens to fall before the
+  // cutoff (same fix as matching-engine.js, caught in code review there first).
+  const saPayments = saPaymentsRaw;
+  const qbPayments = qbPaymentsRaw;
 
   console.log(`[PAY-MATCH] Matching ${saPayments.length} SA payments against ${qbPayments.length} QB payments...`);
 
@@ -164,6 +186,7 @@ async function runMatching() {
 
     let status = 'unmatched_sa';
     let amountDiff = null;
+    let notes = null;
 
     if (match) {
       matchedQbIds.add(match.qb_id);
@@ -171,6 +194,16 @@ async function runMatching() {
       const qbAmt = parseAmount(match.amount);
       amountDiff = saAmt - qbAmt;
       status = Math.abs(amountDiff) <= AMOUNT_TOLERANCE ? 'matched' : 'discrepancy';
+      if (score > 0 && score < FUZZY_THRESHOLD) notes = 'Low confidence fuzzy match - review recommended';
+    } else {
+      // Payments have no balance/status concept to check like invoices do
+      // (money already changed hands) — the only stand-down reason here is
+      // the pre-cutoff date, checked against this payment's own date only.
+      const t = parseDateMs(sa.payment_date);
+      if (t !== null && t < DATA_START_DATE_MS) {
+        status = 'unmatched_precutoff';
+        notes  = 'No QB match found — SA payment dated before 2023-08-21 (not relevant)';
+      }
     }
 
     results.push({
@@ -187,19 +220,21 @@ async function runMatching() {
       payment_method:   match ? qbPaymentMethodName(match) : null,
       sa_payment_date:  sa.payment_date,
       qb_payment_date:  match?.date || null,
-      notes:            score > 0 && score < FUZZY_THRESHOLD ? 'Low confidence fuzzy match - review recommended' : null,
+      notes,
       created_at:       new Date().toISOString(),
     });
   }
 
   for (const qb of qbPayments) {
     if (!matchedQbIds.has(qb.qb_id)) {
+      const t = parseDateMs(qb.date);
+      const precutoff = t !== null && t < DATA_START_DATE_MS;
       results.push({
         sa_payment_sa_id: null,
         qb_payment_id:    qb.qb_id,
         match_type:       'unmatched',
         match_score:      0,
-        match_status:     'unmatched_qb',
+        match_status:     precutoff ? 'unmatched_precutoff' : 'unmatched_qb',
         sa_amount:        null,
         qb_amount:        parseAmount(qb.amount),
         amount_diff:      null,
@@ -208,7 +243,9 @@ async function runMatching() {
         payment_method:   qbPaymentMethodName(qb),
         sa_payment_date:  null,
         qb_payment_date:  qb.date,
-        notes:            'In QB but not found in SA',
+        notes:            precutoff
+          ? 'In QB but not found in SA — QB payment dated before 2023-08-21 (not relevant)'
+          : 'In QB but not found in SA',
         created_at:       new Date().toISOString(),
       });
     }
@@ -224,10 +261,14 @@ async function runMatching() {
     if (error) console.error('[PAY-MATCH ERROR]', error.message);
   }
 
-  const matched     = results.filter(r => r.match_status === 'matched').length;
-  const discrepancy = results.filter(r => r.match_status === 'discrepancy').length;
-  const unmatchedSA = results.filter(r => r.match_status === 'unmatched_sa').length;
-  const unmatchedQB = results.filter(r => r.match_status === 'unmatched_qb').length;
+  const matched      = results.filter(r => r.match_status === 'matched').length;
+  const discrepancy  = results.filter(r => r.match_status === 'discrepancy').length;
+  const unmatchedSA  = results.filter(r => r.match_status === 'unmatched_sa').length;
+  const unmatchedQB  = results.filter(r => r.match_status === 'unmatched_qb').length;
+  const precutoff    = results.filter(r => r.match_status === 'unmatched_precutoff').length;
+  const unmatchedTotal = results
+    .filter(r => r.match_status === 'unmatched_sa' || r.match_status === 'unmatched_qb')
+    .reduce((s, r) => s + Math.abs(r.sa_amount ?? r.qb_amount ?? 0), 0);
 
   console.log('');
   console.log('═══════════════════════════════════════');
@@ -239,8 +280,8 @@ async function runMatching() {
   console.log(`  Tier 2 (Fuzzy):        ${tier2}`);
   console.log(`  ✅ Matched:            ${matched}`);
   console.log(`  ⚠️  Discrepancies:     ${discrepancy}`);
-  console.log(`  ❌ Unmatched SA:       ${unmatchedSA}`);
-  console.log(`  ❌ Unmatched QB:       ${unmatchedQB}`);
+  console.log(`  ❌ Unmatched (open):   ${unmatchedSA + unmatchedQB} ($${unmatchedTotal.toFixed(2)}) — ${unmatchedSA} SA, ${unmatchedQB} QB`);
+  console.log(`  ⚪ Unmatched (pre-2023-08-21, not counted above): ${precutoff}`);
   console.log('═══════════════════════════════════════');
 }
 
