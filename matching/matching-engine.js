@@ -49,9 +49,10 @@ const SETTLED_TOLERANCE  = 0.02;   // Balance at or below this counts as "$0" (f
 
 // Confirmed by Michael 2026-08-29: anything dated before this is not relevant —
 // SA/QBO data from before this date is incomplete/unreliable on one or both
-// sides (this is when one or both systems were actually put into real use),
-// so records older than this are excluded before matching rather than being
-// flagged as permanently-unmatched noise every run.
+// sides (this is when one or both systems were actually put into real use).
+// Applied per-record to unmatched results only (see classifyUnmatched below),
+// never to the source arrays matching itself runs against — see that
+// function's comment for why.
 const DATA_START_DATE_MS = new Date('2023-08-21T00:00:00Z').getTime();
 
 // ─── Levenshtein distance ────────────────────────────────────────────────────
@@ -108,6 +109,29 @@ function fuzzyScore(saInvoice, qbInvoice) {
   return (nameSim * 0.4) + (amtMatch * 0.4) + (dateScore * 0.2);
 }
 
+// Decides whether an UNMATCHED record should be treated as actionable or not.
+// Two independent reasons to stand down, checked against this record's OWN
+// date/status/balance only (never the other system's):
+//   - dated before the cutoff (Michael confirmed 2026-08-29: not relevant)
+//   - already settled: a $0/near-$0 balance is corroborated by a real
+//     Paid/Voided status, not trusted alone. Both sync scripts coalesce an
+//     unparseable/missing balance to 0 via `parseFloat(...) || 0` (qb-sync.js,
+//     sa-invoice-sync.js), so a bare zero can mean "genuinely paid" or "the
+//     source API didn't return this field" — requiring the status field too
+//     (sourced independently) means a real open invoice essentially never
+//     satisfies both conditions, even if its balance was mis-coalesced.
+//     Caught in code review before this shipped.
+function classifyUnmatched(dateStr, status, balance, settledStatuses) {
+  const t = parseDateMs(dateStr);
+  if (t !== null && t < DATA_START_DATE_MS) {
+    return { settled: true, reason: 'dated before 2023-08-21 (not relevant)' };
+  }
+  if (settledStatuses.includes(status) && parseAmount(balance) <= SETTLED_TOLERANCE) {
+    return { settled: true, reason: `status is "${status}" with $0 balance — not an open discrepancy` };
+  }
+  return { settled: false, reason: null };
+}
+
 // ─── Main matching function ──────────────────────────────────────────────────
 async function runMatching() {
   console.log('[MATCH] Loading SA invoices...');
@@ -123,19 +147,15 @@ async function runMatching() {
     .select('*');
   if (qbErr) throw new Error('QB invoices: ' + qbErr.message);
 
-  // Exclude pre-cutoff records — keep unparseable/missing dates rather than
-  // silently dropping them (only exclude what we can positively confirm is old).
-  const isRelevant = row => {
-    const t = parseDateMs(row.date);
-    return t === null || t >= DATA_START_DATE_MS;
-  };
-  const saInvoices = saInvoicesRaw.filter(isRelevant);
-  const qbInvoices = qbInvoicesRaw.filter(isRelevant);
-  const saExcluded = saInvoicesRaw.length - saInvoices.length;
-  const qbExcluded = qbInvoicesRaw.length - qbInvoices.length;
-  if (saExcluded || qbExcluded) {
-    console.log(`[MATCH] Excluded pre-2023-08-21 records: ${saExcluded} SA, ${qbExcluded} QB`);
-  }
+  // NOTE: the pre-cutoff date filter is applied AFTER matching, per-record, not
+  // here on the source arrays. Matching itself always runs against the FULL,
+  // unfiltered SA and QB sets — a linked pair (matched via QboID/invoice number)
+  // must never be split apart because only one side's own date field happens to
+  // fall before the cutoff (a real risk for records dated right around the
+  // 2023-08-21 boundary, where a few days' system-to-system date discrepancy
+  // could push one side across it). Caught in code review before this shipped.
+  const saInvoices = saInvoicesRaw;
+  const qbInvoices = qbInvoicesRaw;
 
   console.log(`[MATCH] Matching ${saInvoices.length} SA invoices against ${qbInvoices.length} QB invoices...`);
 
@@ -201,11 +221,12 @@ async function runMatching() {
       amountDiff  = saAmt - qbAmt;
       status = Math.abs(amountDiff) <= AMOUNT_TOLERANCE ? 'matched' : 'discrepancy';
       if (score < FUZZY_THRESHOLD) notes = 'Low confidence fuzzy match - review recommended';
-    } else if (parseAmount(sa.invoice_balance) <= SETTLED_TOLERANCE) {
-      // No cross-system link, but this invoice already has a $0 balance —
-      // paid or voided, not an open gap. See file header comment.
-      status = 'unmatched_settled';
-      notes  = 'No QB match found, but SA invoice balance is $0 (paid/voided) — not an open discrepancy';
+    } else {
+      const verdict = classifyUnmatched(sa.date, sa.status, sa.invoice_balance, ['Paid', 'Voided']);
+      if (verdict.settled) {
+        status = 'unmatched_settled';
+        notes  = `No QB match found — SA ${verdict.reason}`;
+      }
     }
 
     results.push({
@@ -227,21 +248,19 @@ async function runMatching() {
   // ── Flag QB invoices with no SA match ─────────────────────────────────
   for (const qb of qbInvoices) {
     if (!matchedQbIds.has(qb.qb_id)) {
-      const settled = parseAmount(qb.balance) <= SETTLED_TOLERANCE;
+      const verdict = classifyUnmatched(qb.date, qb.status, qb.balance, ['Paid']);
       results.push({
         sa_invoice_sa_id: null,
         qb_invoice_id:    qb.qb_id,
         match_type:       'unmatched',
         match_score:      0,
-        match_status:     settled ? 'unmatched_settled' : 'unmatched_qb',
+        match_status:     verdict.settled ? 'unmatched_settled' : 'unmatched_qb',
         sa_amount:        null,
         qb_amount:        parseAmount(qb.amount),
         amount_diff:      null,
         sa_customer:      null,
         qb_customer:      qb.customer_name,
-        notes:            settled
-          ? 'In QB but not found in SA — QB balance is $0 (paid/voided), not an open discrepancy'
-          : 'In QB but not found in SA',
+        notes:            verdict.settled ? `In QB but not found in SA — QB ${verdict.reason}` : 'In QB but not found in SA',
         created_at:       new Date().toISOString()
       });
     }
