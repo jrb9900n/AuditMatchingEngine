@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Environment / credentials
+.env
+
+# Run logs (timestamped output from ame-run.ps1 / manual runs)
+*.log
+*.log.err
+logs/
+
+# Ad-hoc / one-off investigation and scratch scripts dropped in the repo root
+# for manual Supabase lookups (not part of the sync/matching pipeline)
+query-*.mjs
+scratch-*.mjs
+watch-tmp.mjs
+build_revision_sheet.py
